@@ -82,13 +82,11 @@ def is_market_open() -> bool:
 def ocr_image(image_bytes: bytes) -> dict:
     try:
         import io
-        import numpy as np
         import pytesseract
         from PIL import Image, ImageEnhance
 
         img  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         w, h = img.size
-        arr  = np.array(img)
         results = {}
 
         # Region 1: Current price (top right large number)
@@ -98,38 +96,7 @@ def ocr_image(image_bytes: bytes) -> dict:
             price_box, config="--psm 7 -c tessedit_char_whitelist=0123456789.-+"
         ).strip()
 
-        # Region 2: Trend indicator colors (detect red/green boxes)
-        trend_row_y = int(h * 0.155)
-        indicator_x_pcts = {
-            "Hourly": 0.22,
-            "15MIN":  0.30,
-            "5min":   0.385,
-            "macd":   0.47,
-            "1min":   0.555,
-            "3min":   0.635,
-        }
-        trend_colors = {}
-        for name, xpct in indicator_x_pcts.items():
-            px    = int(w * xpct)
-            py    = trend_row_y
-            patch = arr[max(0,py-4):py+4, max(0,px-8):px+8]
-            if patch.size == 0:
-                trend_colors[name] = "⚪"
-                continue
-            r = float(patch[:,:,0].mean())
-            g = float(patch[:,:,1].mean())
-            b = float(patch[:,:,2].mean())
-            if r > 140 and g < 100:
-                trend_colors[name] = "SELL 🔴"
-            elif g > 120 and r < 120:
-                trend_colors[name] = "BUY  🟢"
-            elif r > 180 and g > 150 and b < 80:
-                trend_colors[name] = "NEUTRAL 🟡"
-            else:
-                trend_colors[name] = "⚪"
-        results["trend_colors"] = trend_colors
-
-        # Region 3: Signal box (bottom-left colored panel)
+        # Region 2: Signal box (bottom-left colored panel)
         sig_box  = img.crop((0, int(h * 0.68), int(w * 0.46), h))
         sig_box  = sig_box.resize((sig_box.width * 3, sig_box.height * 3), Image.LANCZOS)
         sig_box  = ImageEnhance.Contrast(sig_box).enhance(3.0)
@@ -186,9 +153,6 @@ def parse_all(ocr_results: dict) -> dict:
     if m:
         sig["current_price"] = m.group(1)
 
-    # Trends
-    sig["trends"] = ocr_results.get("trend_colors", {})
-
     return {k: v for k, v in sig.items() if v is not None and v != {}}
 
 
@@ -209,13 +173,6 @@ def detect_changes(old: dict, new: dict) -> list:
             changed.append("pnl")
     except Exception:
         pass
-
-    # Trend colors
-    old_t = old.get("trends", {})
-    new_t = new.get("trends", {})
-    for tk in new_t:
-        if old_t.get(tk) != new_t.get(tk):
-            changed.append(f"Trend:{tk}")
 
     return changed
 
@@ -239,15 +196,6 @@ def build_message(sig: dict, changed: list, is_first: bool = False) -> str:
     # Current price
     if "current_price" in sig:
         lines.append(f"💹 *Current Price:* `{esc(adjust(sig['current_price']))}`")
-
-    lines.append("─────────────────────")
-
-    # Trend indicators
-    trends = sig.get("trends", {})
-    if trends:
-        lines.append("📊 *Trend Indicators:*")
-        for name, color in trends.items():
-            lines.append(f"  {esc(name):<8} : {color}")
 
     lines.append("─────────────────────")
 
@@ -289,7 +237,6 @@ def build_message(sig: dict, changed: list, is_first: bool = False) -> str:
             elif c == "t2_status": labels.append("✅ Target 2 hit")
             elif c == "t3_status": labels.append("✅ Target 3 hit")
             elif c == "pnl":       labels.append("📊 P&L updated")
-            elif c.startswith("Trend:"): labels.append(f"📉 {c.replace('Trend:','')} trend changed")
         lines.append("\n".join([esc(l) for l in labels]))
 
     return "\n".join(lines)
