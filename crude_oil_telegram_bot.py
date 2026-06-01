@@ -28,6 +28,7 @@ PNL_ALERT_CHANGE = 10   # send alert if P/L changes by this many points
 # ══════════════════════════════════════════════════════════════
 
 CHART_IMAGE_URL = "https://dow.autobuysellsignal.in/CRUDEOIL-I_Chart1.png"
+ZONE_IMAGE_URL  = "https://dow.autobuysellsignal.in/CRUDEOIL-I_Chart2.png"  # Zone/status panel
 STATE_FILE      = "crude_bot_state.json"
 LOG_FILE        = "crude_bot.log"
 
@@ -96,9 +97,9 @@ def ocr_image(image_bytes: bytes) -> dict:
             price_box, config="--psm 7 -c tessedit_char_whitelist=0123456789.-+"
         ).strip()
 
-        # Region 2: Signal box — crop full green panel (all 5 lines of text)
-        # Use full width so "Long At XXXX -Trail SL XXXX" on line 1 is not cut off
-        sig_box  = img.crop((0, int(h * 0.65), w, h))
+        # Region 2: Signal box — use full image height so "Long At" and "P/L" lines
+        # on the upper portion are not cropped out (the chart image IS the signal panel)
+        sig_box  = img.crop((0, 0, w, h))
         sig_box  = sig_box.resize((sig_box.width * 3, sig_box.height * 3), Image.LANCZOS)
         sig_box  = ImageEnhance.Contrast(sig_box).enhance(2.5)
         sig_box  = ImageEnhance.Sharpness(sig_box).enhance(2.0)
@@ -123,6 +124,59 @@ def ocr_image(image_bytes: bytes) -> dict:
     except Exception as e:
         log.error(f"OCR error: {e}")
         return {}
+
+
+
+# ── Zone OCR ──────────────────────────────────────────────────
+
+def ocr_zone(image_bytes: bytes) -> str:
+    """OCR the zone/status panel image, return the text content or empty string."""
+    try:
+        import io
+        import pytesseract
+        from PIL import Image, ImageEnhance
+        import PIL.ImageOps
+
+        img  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        w, h = img.size
+        box  = img.resize((w * 3, h * 3), Image.LANCZOS)
+        box  = ImageEnhance.Contrast(box).enhance(2.5)
+        box  = ImageEnhance.Sharpness(box).enhance(2.0)
+        inv  = PIL.ImageOps.invert(box.convert("L"))
+        bw   = inv.point(lambda x: 255 if x > 100 else 0)
+        text = pytesseract.image_to_string(bw, config="--psm 6").strip()
+        # Collapse whitespace
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+    except Exception as e:
+        log.error(f"Zone OCR error: {e}")
+        return ""
+
+
+def build_zone_message(zone_text: str, is_first: bool = False) -> str:
+    now = datetime.now().strftime("%d %b %Y  %H:%M:%S")
+    t   = zone_text.lower()
+
+    if "sideways" in t:
+        emoji, label = "⚠️", "SIDEWAYS ZONE"
+    elif "long" in t or "buy" in t or "bullish" in t:
+        emoji, label = "🟢", "BULLISH ZONE"
+    elif "short" in t or "sell" in t or "bearish" in t:
+        emoji, label = "🔴", "BEARISH ZONE"
+    else:
+        emoji, label = "🚦", "ZONE UPDATE"
+
+    status_line = "📡 *Monitoring zone\\.\\.\\.\\.*" if is_first else "🔄 *Zone status changed\\!*"
+
+    return (
+        f"🛢 *MCX CRUDE OIL — ZONE ALERT*\n"
+        f"🕐 {esc(now)}\n"
+        f"─────────────────────\n"
+        f"{emoji} *{esc(label)}*\n"
+        f"📋 {esc(zone_text)}\n"
+        f"─────────────────────\n"
+        f"{status_line}"
+    )
 
 
 # ── Signal parser ─────────────────────────────────────────────
@@ -157,12 +211,12 @@ def parse_all(ocr_results: dict) -> dict:
         if m2:
             sig["pnl"] = m2.group(1)
 
-    # Targets + status  ->  "Target 1: 8555.565 :: Achieved"
+    # Targets + status  ->  "Target 1: 8555.565 :: Achieved" (OCR may prefix "| Target")
     for i in range(1, 4):
-        m = re.search(rf"Target\s*{i}\s*[:\s]+([\d.]+)", text, re.IGNORECASE)
+        m = re.search(rf"[|]?\s*Target\s*{i}\s*[:\s]+([\d.]+)", text, re.IGNORECASE)
         if m:
             sig[f"target{i}"] = m.group(1)
-        ms = re.search(rf"Target\s*{i}[^T]*?(Achieved|Pending)", text, re.IGNORECASE)
+        ms = re.search(rf"[|]?\s*Target\s*{i}[^T]*?(Achieved|Pending)", text, re.IGNORECASE)
         if ms:
             sig[f"t{i}_status"] = ms.group(1)
 
@@ -304,7 +358,7 @@ async def send_telegram(session: aiohttp.ClientSession, message: str) -> bool:
 
 # ── Image fetcher with retry ──────────────────────────────────
 
-async def fetch_image_with_retry(session, etag, last_modified, max_retries=3):
+async def fetch_image_with_retry(session, etag, last_modified, max_retries=3, url=None):
     """Fetch image with retry + rotating user agents on timeout."""
     for attempt in range(max_retries):
         headers = {
@@ -321,7 +375,7 @@ async def fetch_image_with_retry(session, etag, last_modified, max_retries=3):
         timeout = aiohttp.ClientTimeout(total=10 + attempt * 10)
 
         try:
-            async with session.get(CHART_IMAGE_URL, headers=headers, timeout=timeout) as r:
+            async with session.get(url or CHART_IMAGE_URL, headers=headers, timeout=timeout) as r:
                 if r.status == 304:
                     log.debug("Image not modified (304)")
                     return None, etag, last_modified
@@ -350,7 +404,8 @@ async def fetch_image_with_retry(session, etag, last_modified, max_retries=3):
 # ── State ─────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    d = {"etag":"","last_modified":"","last_hash":"","last_signal":{}}
+    d = {"etag":"","last_modified":"","last_hash":"","last_signal":{},
+         "zone_hash":"","zone_text":""}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
@@ -367,13 +422,18 @@ def save_state(state: dict):
 # ── Main loop ─────────────────────────────────────────────────
 
 async def monitor():
-    state  = load_state()
-    etag   = state["etag"]
-    lm     = state["last_modified"]
-    last_h = state["last_hash"]
-    last_s = state["last_signal"]
-    errors = 0
-    first  = True
+    state      = load_state()
+    etag       = state["etag"]
+    lm         = state["last_modified"]
+    last_h     = state["last_hash"]
+    last_s     = state["last_signal"]
+    zone_etag  = ""
+    zone_lm    = ""
+    zone_hash  = state.get("zone_hash", "")
+    zone_text  = state.get("zone_text", "")
+    errors     = 0
+    first      = True
+    zone_first = True
 
     log.info("Bot starting up...")
 
@@ -390,6 +450,7 @@ async def monitor():
             "• ✅ A target is achieved\n"
             f"• 📊 P&L changes by {PNL_ALERT_CHANGE}\\+ points\n"
             "• 📉 Any trend indicator flips\n"
+            "• 🚦 Zone status changes \\(Sideways / Trend\\)\n"
             f"Checking every {POLL_INTERVAL}s during market hours\\."
         )
 
@@ -436,6 +497,28 @@ async def monitor():
                     msg = build_message(new_sig, changed)
                     await send_telegram(session, msg)
                     log.info(f"Alert sent → {changed}")
+
+
+                # ── Zone / status image check ─────────────────────────────
+                zone_bytes, zone_etag, zone_lm = await fetch_image_with_retry(
+                    session, zone_etag, zone_lm, url=ZONE_IMAGE_URL
+                )
+                if zone_bytes is not None:
+                    z_hash = hashlib.md5(zone_bytes).hexdigest()
+                    if z_hash != zone_hash:
+                        log.info("Zone image changed → OCR")
+                        z_text = ocr_zone(zone_bytes)
+                        if z_text:
+                            log.info(f"Zone text: {repr(z_text)}")
+                            if zone_first:
+                                await send_telegram(session, build_zone_message(z_text, is_first=True))
+                                zone_first = False
+                            elif z_text.strip().lower() != zone_text.strip().lower():
+                                await send_telegram(session, build_zone_message(z_text, is_first=False))
+                                log.info(f"Zone alert sent: {z_text!r}")
+                            zone_hash = z_hash
+                            zone_text = z_text
+                            state.update({"zone_hash": zone_hash, "zone_text": zone_text})
 
                 last_h = current_h
                 last_s = new_sig
