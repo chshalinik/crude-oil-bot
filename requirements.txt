@@ -1,4 +1,3 @@
 aiohttp
 pytesseract
 pillow
-numpy
