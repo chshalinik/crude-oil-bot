@@ -1,9 +1,9 @@
 """
 MCX Crude Oil Signal Monitor — Real-Time Telegram Alert Bot
-============================================================
-Polls the chart image every 5 seconds using async HTTP.
-Only downloads the image when it actually changes (ETag/Last-Modified).
-Sends Telegram alerts the moment a signal changes.
+- Long = BUY, Short = SELL
+- All price values adjusted by -2
+- P/L updates trigger alerts too
+- Auto-retry on timeout with exponential backoff
 """
 
 import asyncio
@@ -14,16 +14,17 @@ import os
 import re
 import sys
 from datetime import datetime
-from urllib.parse import quote
 
 import aiohttp
 
 # ══════════════════════════════════════════════════════════════
-#  USER CONFIGURATION  ← Edit these 2 lines only
+#  USER CONFIGURATION
 # ══════════════════════════════════════════════════════════════
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8852868919:AAGC69Nd3F3LyepIMW66Do-t_HAW-bhCPoQ")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8755501824")
-POLL_INTERVAL  = 5   # seconds between checks
+POLL_INTERVAL    = 5    # seconds between checks
+PRICE_OFFSET     = -2   # subtract 2 from all price values
+PNL_ALERT_CHANGE = 10   # send alert if P/L changes by this many points
 # ══════════════════════════════════════════════════════════════
 
 CHART_IMAGE_URL = "https://dow.autobuysellsignal.in/CRUDEOIL-I_Chart1.png"
@@ -34,7 +35,13 @@ MARKET_OPEN_HOUR  = 9
 MARKET_CLOSE_HOUR = 23
 MARKET_CLOSE_MIN  = 30
 
-# ── Logging ───────────────────────────────────────────────────
+# Multiple user agents to rotate on retry
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/123.0 Safari/537.36",
+]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -45,6 +52,19 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+# ── Price adjustment ──────────────────────────────────────────
+
+def adjust(value_str: str) -> str:
+    """Subtract 2 from price, keep same decimal places."""
+    try:
+        val      = float(value_str)
+        adjusted = val + PRICE_OFFSET
+        decimals = len(value_str.split(".")[-1]) if "." in value_str else 0
+        return f"{adjusted:.{decimals}f}"
+    except Exception:
+        return value_str
 
 
 # ── Market hours ──────────────────────────────────────────────
@@ -59,122 +79,219 @@ def is_market_open() -> bool:
 
 # ── OCR ───────────────────────────────────────────────────────
 
-def ocr_image(image_bytes: bytes) -> str:
+def ocr_image(image_bytes: bytes) -> dict:
     try:
         import io
+        import numpy as np
         import pytesseract
         from PIL import Image, ImageEnhance
 
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         w, h = img.size
+        arr  = np.array(img)
+        results = {}
 
-        # Crop just the bottom-left signal box (red panel)
-        signal_box = img.crop((0, int(h * 0.70), int(w * 0.45), h))
-        signal_box = signal_box.resize(
-            (signal_box.width * 2, signal_box.height * 2), Image.LANCZOS
-        )
-        signal_box = ImageEnhance.Contrast(signal_box).enhance(2.5)
-        signal_box = ImageEnhance.Sharpness(signal_box).enhance(2.0)
+        # Region 1: Current price (top right large number)
+        price_box = img.crop((int(w * 0.70), 0, w, int(h * 0.10)))
+        price_box = price_box.resize((price_box.width * 2, price_box.height * 2), Image.LANCZOS)
+        results["price_text"] = pytesseract.image_to_string(
+            price_box, config="--psm 7 -c tessedit_char_whitelist=0123456789.-+"
+        ).strip()
 
-        config = "--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./: "
-        return pytesseract.image_to_string(signal_box, config=config).strip()
+        # Region 2: Trend indicator colors (detect red/green boxes)
+        trend_row_y = int(h * 0.155)
+        indicator_x_pcts = {
+            "Hourly": 0.22,
+            "15MIN":  0.30,
+            "5min":   0.385,
+            "macd":   0.47,
+            "1min":   0.555,
+            "3min":   0.635,
+        }
+        trend_colors = {}
+        for name, xpct in indicator_x_pcts.items():
+            px    = int(w * xpct)
+            py    = trend_row_y
+            patch = arr[max(0,py-4):py+4, max(0,px-8):px+8]
+            if patch.size == 0:
+                trend_colors[name] = "⚪"
+                continue
+            r = float(patch[:,:,0].mean())
+            g = float(patch[:,:,1].mean())
+            b = float(patch[:,:,2].mean())
+            if r > 140 and g < 100:
+                trend_colors[name] = "SELL 🔴"
+            elif g > 120 and r < 120:
+                trend_colors[name] = "BUY  🟢"
+            elif r > 180 and g > 150 and b < 80:
+                trend_colors[name] = "NEUTRAL 🟡"
+            else:
+                trend_colors[name] = "⚪"
+        results["trend_colors"] = trend_colors
 
-    except ImportError:
-        log.error("Run: pip install pytesseract pillow")
-        log.error("And: sudo apt install tesseract-ocr")
+        # Region 3: Signal box (bottom-left colored panel)
+        sig_box  = img.crop((0, int(h * 0.68), int(w * 0.46), h))
+        sig_box  = sig_box.resize((sig_box.width * 3, sig_box.height * 3), Image.LANCZOS)
+        sig_box  = ImageEnhance.Contrast(sig_box).enhance(3.0)
+        sig_box  = ImageEnhance.Sharpness(sig_box).enhance(2.5)
+        sig_bw   = sig_box.convert("L").point(lambda x: 255 if x > 160 else 0)
+        results["signal_text"] = pytesseract.image_to_string(
+            sig_bw,
+            config="--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./:- "
+        ).strip()
+
+        return results
+
+    except ImportError as e:
+        log.error(f"Missing package: {e}")
         sys.exit(1)
     except Exception as e:
         log.error(f"OCR error: {e}")
-        return ""
+        return {}
 
 
 # ── Signal parser ─────────────────────────────────────────────
 
-def parse_signal(text: str) -> dict:
+def parse_all(ocr_results: dict) -> dict:
     sig  = {}
-    text = text.replace("\n", " ").replace("|", " ")
+    text = ocr_results.get("signal_text", "").replace("\n", " ")
 
-    def find(pattern):
-        m = re.search(pattern, text, re.IGNORECASE)
-        return m.group(1).strip() if m else None
-
+    # Action: Long=BUY, Short=SELL
     m = re.search(r"(Short|Long)\s+At\s+([\d.]+)", text, re.IGNORECASE)
     if m:
-        sig["action"] = m.group(1).upper()
+        sig["action"] = "BUY" if m.group(1).upper() == "LONG" else "SELL"
         sig["entry"]  = m.group(2)
 
-    sig["trail_sl"] = find(r"Trail\s*SL\s*([\d.]+)")
-    sig["pnl"]      = find(r"P[/\\]?L[:\s]*([-\d.]+)\s*Points?")
-    sig["target1"]  = find(r"Target\s*1[:\s]*([\d.]+)")
-    sig["target2"]  = find(r"Target\s*2[:\s]*([\d.]+)")
-    sig["target3"]  = find(r"Target\s*3[:\s]*([\d.]+)")
+    # Trail SL
+    m = re.search(r"Trail\s*SL\s*([\d.]+)", text, re.IGNORECASE)
+    if m:
+        sig["trail_sl"] = m.group(1)
 
-    for i, key in enumerate(["t1_status", "t2_status", "t3_status"], 1):
-        m = re.search(rf"Target\s*{i}.*?(Achieved|Pending)", text, re.IGNORECASE)
-        sig[key] = m.group(1) if m else None
+    # P/L — always capture latest value
+    m = re.search(r"P[/\\]?L[:\s]*([-\d.]+)\s*Points?", text, re.IGNORECASE)
+    if m:
+        sig["pnl"] = m.group(1)
 
-    return {k: v for k, v in sig.items() if v is not None}
+    # Targets + status
+    for i in range(1, 4):
+        m = re.search(rf"Target\s*{i}[:\s]*([\d.]+)", text, re.IGNORECASE)
+        if m:
+            sig[f"target{i}"] = m.group(1)
+        ms = re.search(rf"Target\s*{i}.*?(Achieved|Pending)", text, re.IGNORECASE)
+        if ms:
+            sig[f"t{i}_status"] = ms.group(1)
+
+    # Current price
+    m = re.search(r"(\d{4,6})", ocr_results.get("price_text", ""))
+    if m:
+        sig["current_price"] = m.group(1)
+
+    # Trends
+    sig["trends"] = ocr_results.get("trend_colors", {})
+
+    return {k: v for k, v in sig.items() if v is not None and v != {}}
 
 
 def detect_changes(old: dict, new: dict) -> list:
-    return [k for k, v in new.items() if old.get(k) != v]
+    """Detect what changed between old and new signal, including P/L."""
+    changed = []
+
+    # Key signal fields
+    for k in ["action", "entry", "trail_sl", "t1_status", "t2_status", "t3_status"]:
+        if old.get(k) != new.get(k):
+            changed.append(k)
+
+    # P/L — alert if changed by PNL_ALERT_CHANGE points or more
+    try:
+        old_pnl = float(old.get("pnl", 0))
+        new_pnl = float(new.get("pnl", 0))
+        if abs(new_pnl - old_pnl) >= PNL_ALERT_CHANGE:
+            changed.append("pnl")
+    except Exception:
+        pass
+
+    # Trend colors
+    old_t = old.get("trends", {})
+    new_t = new.get("trends", {})
+    for tk in new_t:
+        if old_t.get(tk) != new_t.get(tk):
+            changed.append(f"Trend:{tk}")
+
+    return changed
 
 
-# ── Message formatter ─────────────────────────────────────────
+# ── Message builder ───────────────────────────────────────────
 
-FIELD_LABELS = {
-    "action":    "Direction",
-    "entry":     "Entry",
-    "trail_sl":  "Trail SL",
-    "pnl":       "P&L (pts)",
-    "target1":   "Target 1",
-    "target2":   "Target 2",
-    "target3":   "Target 3",
-    "t1_status": "T1 Status",
-    "t2_status": "T2 Status",
-    "t3_status": "T3 Status",
-}
+def esc(text: str) -> str:
+    """Escape for Telegram MarkdownV2."""
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
-def build_message(signal: dict, changed: list, is_first: bool = False) -> str:
-    now   = datetime.now().strftime("%d %b %Y  %H:%M:%S")
-    emoji = "🔴" if signal.get("action") == "SHORT" else "🟢"
 
-    lines = [
-        "🛢 *MCX CRUDE OIL SIGNAL*",
-        f"🕐 {now}",
-        "─────────────────────",
-    ]
+def build_message(sig: dict, changed: list, is_first: bool = False) -> str:
+    now    = datetime.now().strftime("%d %b %Y  %H:%M:%S")
+    action = sig.get("action", "")
+    emoji  = "🟢" if action == "BUY" else "🔴"
 
-    if "action" in signal:
-        lines.append(f"{emoji} *{signal['action']}* @ ₹{signal.get('entry', '—')}")
-    if "trail_sl" in signal:
-        lines.append(f"🛑 Trail SL : `{signal['trail_sl']}`")
-    if "pnl" in signal:
-        pnl     = float(signal["pnl"])
-        p_emoji = "📈" if pnl >= 0 else "📉"
-        lines.append(f"{p_emoji} P&L       : `{signal['pnl']} pts`")
+    lines = ["🛢 *MCX CRUDE OIL SIGNAL*", f"🕐 {esc(now)}"]
+
+    # Current price
+    if "current_price" in sig:
+        lines.append(f"💹 *Current Price:* `{esc(adjust(sig['current_price']))}`")
 
     lines.append("─────────────────────")
 
+    # Trend indicators
+    trends = sig.get("trends", {})
+    if trends:
+        lines.append("📊 *Trend Indicators:*")
+        for name, color in trends.items():
+            lines.append(f"  {esc(name):<8} : {color}")
+
+    lines.append("─────────────────────")
+
+    # Signal
+    if action:
+        lines.append(f"{emoji} *{action} SIGNAL*")
+        lines.append(f"📌 Entry     : `₹{esc(adjust(sig.get('entry','0')))}`")
+    if "trail_sl" in sig:
+        lines.append(f"🛑 Trail SL  : `{esc(adjust(sig['trail_sl']))}`")
+    if "pnl" in sig:
+        pnl = float(sig["pnl"])
+        lines.append(f"{'📈' if pnl >= 0 else '📉'} P&L        : `{esc(sig['pnl'])} pts`")
+
+    lines.append("─────────────────────")
+
+    # Targets
     for i, (tkey, skey) in enumerate([
-        ("target1", "t1_status"),
-        ("target2", "t2_status"),
-        ("target3", "t3_status"),
+        ("target1","t1_status"),
+        ("target2","t2_status"),
+        ("target3","t3_status"),
     ], 1):
-        val    = signal.get(tkey, "—")
-        status = signal.get(skey, "")
-        badge  = "✅" if status == "Achieved" else "🎯"
-        lines.append(f"{badge} T{i}: `{val}`   {status}")
+        if tkey in sig:
+            status = sig.get(skey, "Pending")
+            badge  = "✅" if status == "Achieved" else "🎯"
+            lines.append(f"{badge} T{i}: `{esc(adjust(sig[tkey]))}` {esc(status)}")
 
     lines.append("─────────────────────")
 
+    # What changed
     if is_first:
-        lines.append("📡 *Bot connected — monitoring live*")
+        lines.append("📡 *Monitoring live\\.\\.\\.*")
     elif changed:
-        readable = [FIELD_LABELS.get(k, k) for k in changed]
-        lines.append(f"⚡ *Updated:* {', '.join(readable)}")
+        labels = []
+        for c in changed:
+            if c == "action":      labels.append("🆕 New Signal")
+            elif c == "entry":     labels.append("📌 Entry changed")
+            elif c == "trail_sl":  labels.append("🛑 Trail SL updated")
+            elif c == "t1_status": labels.append("✅ Target 1 hit")
+            elif c == "t2_status": labels.append("✅ Target 2 hit")
+            elif c == "t3_status": labels.append("✅ Target 3 hit")
+            elif c == "pnl":       labels.append("📊 P&L updated")
+            elif c.startswith("Trend:"): labels.append(f"📉 {c.replace('Trend:','')} trend changed")
+        lines.append("\n".join([esc(l) for l in labels]))
 
-    lines.append("\n_autobuysellsignal\\.in_")
     return "\n".join(lines)
 
 
@@ -182,73 +299,93 @@ def build_message(signal: dict, changed: list, is_first: bool = False) -> str:
 
 async def send_telegram(session: aiohttp.ClientSession, message: str) -> bool:
     if "YOUR_BOT_TOKEN" in TELEGRAM_TOKEN:
-        log.warning("Set TELEGRAM_TOKEN in environment variables!")
-        log.info(f"[TEST]\n{message}")
+        log.warning("Set TELEGRAM_TOKEN env variable!")
+        log.info(f"[TEST MSG]\n{message}")
         return False
 
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id":    TELEGRAM_CHAT_ID,
-        "text":       message,
-        "parse_mode": "MarkdownV2",
-    }
-    try:
-        async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            body = await r.json()
-            if body.get("ok"):
-                log.info("✅ Telegram message sent!")
-                return True
-            log.warning(f"Telegram error: {body}")
-            return False
-    except Exception as e:
-        log.error(f"Telegram send error: {e}")
-        return False
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "MarkdownV2"}
+
+    for attempt in range(3):
+        try:
+            async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                body = await r.json()
+                if body.get("ok"):
+                    log.info("✅ Telegram sent!")
+                    return True
+                log.warning(f"Telegram API error: {body}")
+                # Formatting error — retry as plain text
+                if body.get("error_code") == 400:
+                    data2 = {"chat_id": TELEGRAM_CHAT_ID,
+                             "text": re.sub(r"[*_`\\]", "", message)}
+                    async with session.post(url, json=data2) as r2:
+                        b2 = await r2.json()
+                        if b2.get("ok"):
+                            log.info("✅ Telegram sent (plain text fallback)")
+                            return True
+                return False
+        except Exception as e:
+            log.warning(f"Telegram attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(2 ** attempt)
+    return False
 
 
-# ── Image fetcher with ETag ───────────────────────────────────
+# ── Image fetcher with retry ──────────────────────────────────
 
-async def fetch_image_if_changed(session, etag, last_modified):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Referer":    "https://autobuysellsignal.in/",
-    }
-    if etag:
-        headers["If-None-Match"] = etag
-    if last_modified:
-        headers["If-Modified-Since"] = last_modified
+async def fetch_image_with_retry(session, etag, last_modified, max_retries=3):
+    """Fetch image with retry + rotating user agents on timeout."""
+    for attempt in range(max_retries):
+        headers = {
+            "User-Agent": USER_AGENTS[attempt % len(USER_AGENTS)],
+            "Referer":    "https://autobuysellsignal.in/",
+            "Accept":     "image/png,image/*,*/*",
+        }
+        if etag and attempt == 0:
+            headers["If-None-Match"] = etag
+        if last_modified and attempt == 0:
+            headers["If-Modified-Since"] = last_modified
 
-    try:
-        async with session.get(
-            CHART_IMAGE_URL, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if r.status == 304:
-                return None, etag, last_modified
-            if r.status == 200:
-                data = await r.read()
-                return data, r.headers.get("ETag", ""), r.headers.get("Last-Modified", "")
-            log.warning(f"Image fetch HTTP {r.status}")
-            return None, etag, last_modified
-    except asyncio.TimeoutError:
-        log.warning("Image fetch timed out")
-        return None, etag, last_modified
-    except Exception as e:
-        log.error(f"Image fetch error: {e}")
-        return None, etag, last_modified
+        # Increase timeout on each retry
+        timeout = aiohttp.ClientTimeout(total=10 + attempt * 10)
+
+        try:
+            async with session.get(CHART_IMAGE_URL, headers=headers, timeout=timeout) as r:
+                if r.status == 304:
+                    log.debug("Image not modified (304)")
+                    return None, etag, last_modified
+                if r.status == 200:
+                    data = await r.read()
+                    log.debug(f"Image fetched: {len(data)} bytes")
+                    return data, r.headers.get("ETag",""), r.headers.get("Last-Modified","")
+                log.warning(f"Image HTTP {r.status} on attempt {attempt+1}")
+
+        except asyncio.TimeoutError:
+            wait = 2 ** attempt
+            log.warning(f"Image fetch timeout (attempt {attempt+1}/{max_retries}) — retrying in {wait}s")
+            await asyncio.sleep(wait)
+        except aiohttp.ClientError as e:
+            wait = 2 ** attempt
+            log.warning(f"Image fetch error (attempt {attempt+1}): {e} — retrying in {wait}s")
+            await asyncio.sleep(wait)
+        except Exception as e:
+            log.error(f"Unexpected fetch error: {e}")
+            break
+
+    log.error("All fetch attempts failed — will try again next cycle")
+    return None, etag, last_modified
 
 
 # ── State ─────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    defaults = {"etag": "", "last_modified": "", "last_hash": "", "last_signal": {}}
+    d = {"etag":"","last_modified":"","last_hash":"","last_signal":{}}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
-                return {**defaults, **json.load(f)}
+                return {**d, **json.load(f)}
         except Exception:
             pass
-    return defaults
-
+    return d
 
 def save_state(state: dict):
     with open(STATE_FILE, "w") as f:
@@ -266,15 +403,22 @@ async def monitor():
     errors = 0
     first  = True
 
+    log.info("Bot starting up...")
+
     async with aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
+        connector=aiohttp.TCPConnector(limit=5, ttl_dns_cache=300, ssl=False)
     ) as session:
 
         await send_telegram(
             session,
             "🛢 *MCX Crude Oil Bot Started\\!*\n"
-            f"Checking every {POLL_INTERVAL}s during market hours\\.\n"
-            "_autobuysellsignal\\.in_"
+            "You will get alerts when:\n"
+            "• 🆕 New BUY or SELL signal fires\n"
+            "• 🛑 Trail SL is updated\n"
+            "• ✅ A target is achieved\n"
+            f"• 📊 P&L changes by {PNL_ALERT_CHANGE}\\+ points\n"
+            "• 📉 Any trend indicator flips\n"
+            f"Checking every {POLL_INTERVAL}s during market hours\\."
         )
 
         while True:
@@ -284,42 +428,45 @@ async def monitor():
                     await asyncio.sleep(300)
                     continue
 
-                image_bytes, etag, lm = await fetch_image_if_changed(session, etag, lm)
+                image_bytes, etag, lm = await fetch_image_with_retry(session, etag, lm)
 
                 if image_bytes is None:
-                    errors = 0
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
                 current_h = hashlib.md5(image_bytes).hexdigest()
                 if current_h == last_h:
+                    log.debug("No content change")
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                log.info("📊 Image changed → running OCR")
-                text = ocr_image(image_bytes)
-
-                if not text:
-                    log.warning("OCR empty — skipping")
+                log.info("📊 Image changed → OCR")
+                ocr_results = ocr_image(image_bytes)
+                if not ocr_results:
                     last_h = current_h
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                new_signal = parse_signal(text)
-                log.info(f"Parsed: {new_signal}")
-                changed    = detect_changes(last_s, new_signal)
+                new_sig = parse_all(ocr_results)
+                log.info(f"Parsed → action={new_sig.get('action')} "
+                         f"entry={new_sig.get('entry')} "
+                         f"sl={new_sig.get('trail_sl')} "
+                         f"pnl={new_sig.get('pnl')} "
+                         f"price={new_sig.get('current_price')}")
 
-                if first and new_signal:
-                    msg = build_message(new_signal, [], is_first=True)
+                changed = detect_changes(last_s, new_sig)
+
+                if first and new_sig:
+                    msg = build_message(new_sig, [], is_first=True)
                     await send_telegram(session, msg)
                     first = False
-                elif changed and new_signal:
-                    msg = build_message(new_signal, changed)
+                elif changed and new_sig:
+                    msg = build_message(new_sig, changed)
                     await send_telegram(session, msg)
-                    log.info(f"Alert sent — changed: {changed}")
+                    log.info(f"Alert sent → {changed}")
 
                 last_h = current_h
-                last_s = new_signal
+                last_s = new_sig
                 state.update({
                     "etag": etag, "last_modified": lm,
                     "last_hash": last_h, "last_signal": last_s,
@@ -333,7 +480,7 @@ async def monitor():
                 errors += 1
                 log.error(f"Loop error #{errors}: {e}", exc_info=True)
                 if errors >= 10:
-                    log.critical("10 errors in a row — pausing 10 min")
+                    log.critical("10 errors — pausing 10 min")
                     await asyncio.sleep(600)
                     errors = 0
 
@@ -341,20 +488,8 @@ async def monitor():
 
 
 if __name__ == "__main__":
-    print("""
-╔═══════════════════════════════════════════════════════╗
-║   MCX Crude Oil — Real-Time Telegram Alert Bot        ║
-╚═══════════════════════════════════════════════════════╝
-  Chat ID : 8755501824 (already set)
-  Token   : Set TELEGRAM_TOKEN environment variable
-            OR paste it directly in the script
-
-  Install : pip install aiohttp pytesseract pillow
-            sudo apt install tesseract-ocr
-
-  Run     : python crude_oil_telegram_bot.py
-""")
+    print("🛢 MCX Crude Oil Telegram Bot starting...")
     try:
         asyncio.run(monitor())
     except KeyboardInterrupt:
-        print("\n🛑 Bot stopped.")
+        print("\n🛑 Stopped.")
