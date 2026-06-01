@@ -143,8 +143,8 @@ def ocr_image(image_bytes: bytes) -> dict:
         return results
 
     except ImportError as e:
-        log.error(f"Missing package: {e}")
-        sys.exit(1)
+        log.error(f"Missing package: {e} — check requirements.txt and Dockerfile")
+        return {}  # Don't crash the whole process; let the loop skip this cycle
     except Exception as e:
         log.error(f"OCR error: {e}")
         return {}
