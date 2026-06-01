@@ -12,7 +12,7 @@ import aiohttp
 # ══════════════════════════════════════════════════════════════
 #  USER CONFIGURATION
 # ══════════════════════════════════════════════════════════════
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8852868919:AAGC69Nd3F3LyepIMW66Do-t_HAW-bhCPoQ")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8755501824")
 POLL_INTERVAL    = 5    # seconds between checks
 PRICE_OFFSET     = -2   # subtract 2 from all price values
@@ -47,7 +47,6 @@ log = logging.getLogger(__name__)
 # ── Price adjustment ──────────────────────────────────────────
 
 def adjust(value_str: str) -> str:
-    """Subtract 2 from price, keep same decimal places."""
     try:
         val      = float(value_str)
         adjusted = val + PRICE_OFFSET
@@ -74,24 +73,24 @@ def ocr_image(image_bytes: bytes) -> dict:
         import io
         import pytesseract
         from PIL import Image, ImageEnhance
+        import PIL.ImageOps
 
         img  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         w, h = img.size
         results = {}
 
-        # Region 1: Current price
+        # Current price
         price_box = img.crop((int(w * 0.70), 0, w, int(h * 0.10)))
         price_box = price_box.resize((price_box.width * 2, price_box.height * 2), Image.LANCZOS)
         results["price_text"] = pytesseract.image_to_string(
             price_box, config="--psm 7 -c tessedit_char_whitelist=0123456789.-+"
         ).strip()
 
-        # Region 2: Signal box
+        # Signal box
         sig_box  = img.crop((0, int(h * 0.65), w, h))
         sig_box  = sig_box.resize((sig_box.width * 3, sig_box.height * 3), Image.LANCZOS)
         sig_box  = ImageEnhance.Contrast(sig_box).enhance(2.5)
         sig_box  = ImageEnhance.Sharpness(sig_box).enhance(2.0)
-        import PIL.ImageOps
         sig_inv  = PIL.ImageOps.invert(sig_box.convert("L"))
         sig_bw   = sig_inv.point(lambda x: 255 if x > 100 else 0)
         results["signal_text"] = pytesseract.image_to_string(
@@ -147,7 +146,6 @@ def parse_all(ocr_results: dict) -> dict:
 
 
 def detect_changes(old: dict, new: dict) -> list:
-    """Detect what changed between old and new signal."""
     changed = []
     for k in ["action", "entry", "trail_sl", "t1_status", "t2_status", "t3_status", "pnl"]:
         if old.get(k) != new.get(k):
@@ -203,4 +201,3 @@ def build_message(sig: dict, changed: list, is_first: bool = False) -> str:
         lines.append("📡 *Monitoring live\\.\\.\\.*")
     elif changed:
         labels = []
-        for
