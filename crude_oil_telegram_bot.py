@@ -96,15 +96,23 @@ def ocr_image(image_bytes: bytes) -> dict:
             price_box, config="--psm 7 -c tessedit_char_whitelist=0123456789.-+"
         ).strip()
 
-        # Region 2: Signal box (bottom-left colored panel)
-        sig_box  = img.crop((0, int(h * 0.68), int(w * 0.46), h))
+        # Region 2: Signal box — crop full green panel (all 5 lines of text)
+        # Use full width so "Long At XXXX -Trail SL XXXX" on line 1 is not cut off
+        sig_box  = img.crop((0, int(h * 0.65), w, h))
         sig_box  = sig_box.resize((sig_box.width * 3, sig_box.height * 3), Image.LANCZOS)
-        sig_box  = ImageEnhance.Contrast(sig_box).enhance(3.0)
-        sig_box  = ImageEnhance.Sharpness(sig_box).enhance(2.5)
-        sig_bw   = sig_box.convert("L").point(lambda x: 255 if x > 160 else 0)
+        sig_box  = ImageEnhance.Contrast(sig_box).enhance(2.5)
+        sig_box  = ImageEnhance.Sharpness(sig_box).enhance(2.0)
+        # White text on dark green: invert so text is dark on light for Tesseract
+        import PIL.ImageOps
+        sig_inv  = PIL.ImageOps.invert(sig_box.convert("L"))
+        sig_bw   = sig_inv.point(lambda x: 255 if x > 100 else 0)
         results["signal_text"] = pytesseract.image_to_string(
             sig_bw,
-            config="--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./:- "
+            config=(
+                "--psm 6 "
+                "-c tessedit_char_whitelist="
+                "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./:- "
+            )
         ).strip()
 
         return results
@@ -121,38 +129,41 @@ def ocr_image(image_bytes: bytes) -> dict:
 
 def parse_all(ocr_results: dict) -> dict:
     sig  = {}
-    text = ocr_results.get("signal_text", "").replace("\n", " ")
+    # Normalise OCR noise: collapse multiple spaces
+    raw  = ocr_results.get("signal_text", "")
+    text = re.sub(r"[ \t]+", " ", raw).replace("\n", " ")
 
-    # Action: Long=BUY, Short=SELL
-    m = re.search(r"(Short|Long)\s+At\s+([\d.]+)", text, re.IGNORECASE)
+    # Action + Entry  ->  "Long At 8513" / "Short At 8513.5"
+    m = re.search(r"(Long|Short)\s+At\s+([\d.]+)", text, re.IGNORECASE)
     if m:
         sig["action"] = "BUY" if m.group(1).upper() == "LONG" else "SELL"
         sig["entry"]  = m.group(2)
 
-    # Trail SL
-    m = re.search(r"Trail\s*SL\s*([\d.]+)", text, re.IGNORECASE)
+    # Trail SL  ->  "-Trail SL 8584.461" or "Trail SL 8584"
+    m = re.search(r"-?\s*Trail\s*SL\s*([\d.]+)", text, re.IGNORECASE)
     if m:
         sig["trail_sl"] = m.group(1)
 
-    # P/L — always capture latest value
-    m = re.search(r"P[/\\]?L[:\s]*([-\d.]+)\s*Points?", text, re.IGNORECASE)
+    # P/L  ->  "Current P/L: 96 Points" or "P/L: -12 Points"
+    m = re.search(r"(?:Current\s+)?P[/\\]?L[:\s]*([-\d.]+)\s*Points?", text, re.IGNORECASE)
     if m:
         sig["pnl"] = m.group(1)
 
-    # Targets + status
+    # Targets + status  ->  "Target 1: 8555.565 :: Achieved"
     for i in range(1, 4):
-        m = re.search(rf"Target\s*{i}[:\s]*([\d.]+)", text, re.IGNORECASE)
+        m = re.search(rf"Target\s*{i}\s*[:\s]+([\d.]+)", text, re.IGNORECASE)
         if m:
             sig[f"target{i}"] = m.group(1)
-        ms = re.search(rf"Target\s*{i}.*?(Achieved|Pending)", text, re.IGNORECASE)
+        ms = re.search(rf"Target\s*{i}[^T]*?(Achieved|Pending)", text, re.IGNORECASE)
         if ms:
             sig[f"t{i}_status"] = ms.group(1)
 
-    # Current price
+    # Current price (from separate price region)
     m = re.search(r"(\d{4,6})", ocr_results.get("price_text", ""))
     if m:
         sig["current_price"] = m.group(1)
 
+    log.debug(f"Raw OCR signal text: {repr(text)}")
     return {k: v for k, v in sig.items() if v is not None and v != {}}
 
 
