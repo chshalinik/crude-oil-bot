@@ -144,10 +144,18 @@ def parse_all(ocr_results: dict) -> dict:
     if m:
         sig["trail_sl"] = m.group(1)
 
-    # P/L  ->  "Current P/L: 96 Points" or "P/L: -12 Points"
-    m = re.search(r"(?:Current\s+)?P[/\\]?L[:\s]*([-\d.]+)\s*Points?", text, re.IGNORECASE)
+    # P/L  ->  "Current P/L: 96 Points" / "P/L: -12 Points" / "P L 96 Points" (OCR noise)
+    m = re.search(
+        r"(?:Current\s+)?P\s*[/\\|l]?\s*L\s*[:\s]+([-\d.]+)\s*Points?",
+        text, re.IGNORECASE
+    )
     if m:
         sig["pnl"] = m.group(1)
+    else:
+        # Fallback: bare "80 Points" after any P&L-related keyword
+        m2 = re.search(r"(?:P[&/]?L|Points?)[:\s]+([-\d.]+)\s*Points?", text, re.IGNORECASE)
+        if m2:
+            sig["pnl"] = m2.group(1)
 
     # Targets + status  ->  "Target 1: 8555.565 :: Achieved"
     for i in range(1, 4):
@@ -163,7 +171,7 @@ def parse_all(ocr_results: dict) -> dict:
     if m:
         sig["current_price"] = m.group(1)
 
-    log.debug(f"Raw OCR signal text: {repr(text)}")
+    log.info(f"Raw OCR signal text: {repr(text)}")
     return {k: v for k, v in sig.items() if v is not None and v != {}}
 
 
@@ -212,13 +220,19 @@ def build_message(sig: dict, changed: list, is_first: bool = False) -> str:
 
     # Signal
     if action:
+        direction = "Long" if action == "BUY" else "Short"
         lines.append(f"{emoji} *{action} SIGNAL*")
-        lines.append(f"📌 Entry     : `₹{esc(adjust(sig.get('entry','0')))}`")
+        entry_val = adjust(sig['entry']) if 'entry' in sig else '—'
+        lines.append(f"📌 {direction} At   : `₹{esc(entry_val)}`")
     if "trail_sl" in sig:
         lines.append(f"🛑 Trail SL  : `{esc(adjust(sig['trail_sl']))}`")
     if "pnl" in sig:
-        pnl = float(sig["pnl"])
-        lines.append(f"{'📈' if pnl >= 0 else '📉'} P&L        : `{esc(sig['pnl'])} pts`")
+        try:
+            pnl = float(sig["pnl"])
+            pnl_str = f"+{sig['pnl']}" if pnl > 0 else sig["pnl"]
+            lines.append(f"{'📈' if pnl >= 0 else '📉'} P&L        : `{esc(pnl_str)} pts`")
+        except Exception:
+            lines.append(f"📊 P&L        : `{esc(sig['pnl'])} pts`")
 
     lines.append("─────────────────────")
 
