@@ -23,8 +23,8 @@ import aiohttp
 # ══════════════════════════════════════════════════════════════
 #  USER CONFIGURATION  ← Edit these 3 lines only
 # ══════════════════════════════════════════════════════════════
-WHATSAPP_NUMBER  = "+91XXXXXXXXXX"   # Your WhatsApp number with country code
-CALLMEBOT_APIKEY = "YOUR_API_KEY"    # From CallMeBot (see setup guide below)
+CHAT_ID  = "8755501824"   # Your WhatsApp number with country code
+TELEGRAM_APIKEY = "8852868919:AAGC69Nd3F3LyepIMW66Do-t_HAW-bhCPoQ"    # From CallMeBot (see setup guide below)
 POLL_INTERVAL    = 5                 # Seconds between checks (5 = near real-time)
 # ══════════════════════════════════════════════════════════════
 
