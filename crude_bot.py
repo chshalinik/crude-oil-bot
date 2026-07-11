@@ -124,7 +124,7 @@ def ocr_image(image_bytes: bytes) -> dict:
         log.error(f"OCR error: {e}")
         return {}
 
-
+log.info(f"RAW OCR TEXT: {repr(ocr_results)}")
 # ── Signal parser ─────────────────────────────────────────────
 
 def parse_all(ocr_results: dict) -> dict:
