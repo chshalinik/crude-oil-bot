@@ -96,25 +96,36 @@ def ocr_image(image_bytes: bytes) -> dict:
             price_box, config="--psm 7 -c tessedit_char_whitelist=0123456789.-+"
         ).strip()
 
-        # Region 2: Signal box — crop full green panel (all 5 lines of text)
-        # Use full width so "Long At XXXX -Trail SL XXXX" on line 1 is not cut off
-        sig_box  = img.crop((0, int(h * 0.65), w, h))
-        sig_box  = sig_box.resize((sig_box.width * 3, sig_box.height * 3), Image.LANCZOS)
-        sig_box  = ImageEnhance.Contrast(sig_box).enhance(2.5)
-        sig_box  = ImageEnhance.Sharpness(sig_box).enhance(2.0)
-        # White text on dark green: invert so text is dark on light for Tesseract
+        # Signal box: bottom-left panel (red=SELL, green=BUY)
+        # From screenshot: box occupies ~left 38% width, bottom ~28% height
+        sig_box = img.crop((0, int(h * 0.72), int(w * 0.38), h))
+        # Scale up 3x for better OCR accuracy
+        sig_box = sig_box.resize((sig_box.width * 3, sig_box.height * 3), Image.LANCZOS)
+        # Convert to grayscale and invert (white text on colored bg -> dark on light)
         import PIL.ImageOps
-        sig_inv  = PIL.ImageOps.invert(sig_box.convert("L"))
-        sig_bw   = sig_inv.point(lambda x: 255 if x > 100 else 0)
+        sig_gray = sig_box.convert("L")
+        sig_inv  = PIL.ImageOps.invert(sig_gray)
+        # Threshold: make it crisp black & white
+        sig_bw   = sig_inv.point(lambda x: 255 if x > 80 else 0)
+        # Run OCR with PSM 6 (assume uniform block of text)
         results["signal_text"] = pytesseract.image_to_string(
             sig_bw,
-            config=(
-                "--psm 6 "
-                "-c tessedit_char_whitelist="
-                "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./:- "
-            )
+            config="--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./:- "
         ).strip()
+        # Also try raw (non-inverted) in case bg is dark enough
+        sig_bw2  = sig_gray.point(lambda x: 255 if x > 180 else 0)
+        alt_text = pytesseract.image_to_string(
+            sig_bw2,
+            config="--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./:- "
+        ).strip()
+        # Pick whichever reading contains more signal keywords
+        keywords = ["Short", "Long", "Trail", "Target", "P/L", "Points"]
+        score1 = sum(1 for k in keywords if k.lower() in results["signal_text"].lower())
+        score2 = sum(1 for k in keywords if k.lower() in alt_text.lower())
+        if score2 > score1:
+            results["signal_text"] = alt_text
 
+        log.info(f"RAW OCR: {repr(results.get('signal_text', ''))}")
         return results
 
     except ImportError as e:
@@ -124,7 +135,7 @@ def ocr_image(image_bytes: bytes) -> dict:
         log.error(f"OCR error: {e}")
         return {}
 
-log.info(f"RAW OCR TEXT: {repr(ocr_results)}")
+
 # ── Signal parser ─────────────────────────────────────────────
 
 def parse_all(ocr_results: dict) -> dict:
