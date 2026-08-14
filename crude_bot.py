@@ -21,7 +21,7 @@ import aiohttp
 #  USER CONFIGURATION
 # ══════════════════════════════════════════════════════════════
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8852868919:AAGC69Nd3F3LyepIMW66Do-t_HAW-bhCPoQ")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8755501824")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003956544457")
 POLL_INTERVAL    = 5    # seconds between checks
 PRICE_OFFSET     = -2   # subtract 2 from all price values
 PNL_ALERT_CHANGE = 10   # send alert if P/L changes by this many points
